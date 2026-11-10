@@ -11,5 +11,5 @@ pub struct Args {
 
     /// Path to the output Markdown file
     #[arg(short, long, default_value = "treepack.md")]
-    pub output: String,
+    pub output: PathBuf,
 }

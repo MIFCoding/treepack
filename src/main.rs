@@ -3,45 +3,48 @@ mod markdown;
 
 use args::Args;
 use clap::Parser;
-use std::{fs, io, path::Path};
+use markdown::MarkdownFile;
+use std::{fs, io};
 use walkdir::WalkDir;
 
-fn is_text_utf8(path: &Path) -> io::Result<bool> {
-    let bytes = fs::read(path)?;
-
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Ok(false);
-    };
-
-    let is_binary = text
+fn is_text(text: &str) -> bool {
+    !text
         .chars()
-        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'));
-
-    Ok(!is_binary)
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
 
-fn main() {
-    let args = Args::parse();
+fn main() -> io::Result<()> {
+    let mut args = Args::parse();
 
-    println!(
-        "Directory: {}\nOutput: {}",
-        args.directory.display(),
-        args.output
-    );
+    if args.output.extension().is_none() {
+        args.output.set_extension("md");
+    }
 
-    for entry in WalkDir::new(args.directory) {
+    let mut treepack_file = MarkdownFile::new(&args.output)?;
+
+    for entry in WalkDir::new(&args.directory).sort_by_file_name() {
         let Ok(entry) = entry else {
             continue;
         };
 
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_file() || treepack_file.path() == entry.path().canonicalize()? {
             continue;
         }
 
-        match is_text_utf8(entry.path()) {
-            Ok(true) => println!("Text: {}", entry.path().display()),
-            Ok(false) => println!("Binary: {}", entry.path().display()),
-            Err(err) => eprintln!("Error: {err}"),
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+
+        if is_text(&content) {
+            treepack_file.append(
+                entry
+                    .path()
+                    .strip_prefix(&args.directory)
+                    .unwrap_or(entry.path()),
+                &content,
+            )?;
         }
     }
+
+    Ok(())
 }
