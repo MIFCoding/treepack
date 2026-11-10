@@ -2,7 +2,10 @@
 name = "treepack"
 version = "0.0.1"
 edition = "2024"
+description = "Pack UTF-8 text files into a Markdown document"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/MIFCoding/treepack"
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
