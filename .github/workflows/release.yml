@@ -7,12 +7,88 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+  RELEASE_BRANCH: main
 
 jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      commit: ${{ steps.package.outputs.commit }}
+      prerelease: ${{ steps.package.outputs.prerelease }}
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - &setup-rust
+        name: Setup Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Validate version and source commit
+        id: package
+        shell: python
+        run: |
+          import json
+          import os
+          import subprocess
+          import sys
+
+          metadata = json.loads(subprocess.check_output([
+              "cargo", "+stable", "metadata",
+              "--no-deps", "--format-version", "1", "--locked",
+          ], text=True))
+
+          packages = [
+              package for package in metadata["packages"]
+              if package["name"] == "treepack"
+              and package["id"] in metadata["workspace_members"]
+          ]
+
+          if len(packages) != 1:
+              sys.exit("Expected exactly one workspace package named treepack")
+
+          version = packages[0]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+
+          if tag != f"v{version}":
+              sys.exit(f"Tag {tag} does not match package version {version}")
+
+          commit = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+
+          branch = os.environ["RELEASE_BRANCH"]
+          subprocess.run([
+              "git", "merge-base", "--is-ancestor",
+              commit, f"origin/{branch}",
+          ], check=True)
+
+          prerelease = "-" in version.split("+", 1)[0]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+              output.write(f"commit={commit}\n")
+              output.write(f"prerelease={str(prerelease).lower()}\n")
+
+          print(f"Validated treepack {version} at {commit}")
+
   build:
     name: Build ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -29,92 +105,526 @@ jobs:
             target: aarch64-apple-darwin
 
     steps:
-      - name: Checkout repository
+      - name: Checkout release commit
         uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
 
-      - name: Setup Rust
-        run: |
-          rustup update stable
-          rustup default stable
+      - *setup-rust
+
+      - name: Install target
+        run: rustup target add ${{ matrix.target }} --toolchain stable
 
       - name: Run tests
-        run: cargo test --release --locked
+        run: cargo +stable test --release --locked --package treepack --target ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --locked
+      - name: Build binary
+        run: cargo +stable build --release --locked --package treepack --bin treepack --target ${{ matrix.target }}
 
-      - name: Package binary (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
+      - name: Verify binary version and package
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        shell: python
         run: |
-          mkdir -p dist
-          tar -czf "dist/treepack-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
-            -C target/release treepack
+          import os
+          import subprocess
+          import sys
+          import tarfile
+          import zipfile
+          from pathlib import Path
 
-      - name: Package binary (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path dist -Force
-          $archive = 'treepack-{0}-{1}.zip' -f $env:GITHUB_REF_NAME, '${{ matrix.target }}'
-          Compress-Archive -Path target/release/treepack.exe -DestinationPath "dist/$archive"
+          target = os.environ["BUILD_TARGET"]
+          version = os.environ["RELEASE_VERSION"]
+          tag = os.environ["GITHUB_REF_NAME"]
 
-      - name: Upload artifact
+          binary_name = "treepack.exe" if os.name == "nt" else "treepack"
+          binary = (Path("target") / target / "release" / binary_name).resolve()
+
+          actual = subprocess.check_output(
+              [str(binary), "--version"], text=True
+          ).strip()
+
+          if actual != f"treepack {version}":
+              sys.exit(f"Unexpected binary version: {actual}")
+
+          dist = Path("dist")
+          dist.mkdir(exist_ok=True)
+          stem = f"treepack-{tag}-{target}"
+
+          if os.name == "nt":
+              with zipfile.ZipFile(
+                  dist / f"{stem}.zip", "w", zipfile.ZIP_DEFLATED
+              ) as archive:
+                  archive.write(binary, arcname=binary_name)
+          else:
+              with tarfile.open(dist / f"{stem}.tar.gz", "w:gz") as archive:
+                  archive.add(binary, arcname=binary_name)
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: treepack-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+          overwrite: true
 
-  release:
-    name: Publish release
-    needs: build
+  prepare-release:
+    name: Prepare GitHub release draft
+    needs: [validate, build]
     runs-on: ubuntu-latest
 
     permissions:
       contents: write
 
+    env:
+      RELEASE_MODE: prepare
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        
-      - name: Download artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
+          pattern: treepack-*
           path: dist
           merge-multiple: true
 
-      - name: Publish GitHub release
-        env:
+      - name: Prepare and verify draft
+        env: &release-env
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag \
-            --generate-notes
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          RELEASE_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        shell: python
+        run: &release-script |
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+          from urllib.parse import quote
+
+          mode = os.environ["RELEASE_MODE"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          repo = os.environ["GH_REPO"]
+          version = os.environ["RELEASE_VERSION"]
+          commit = os.environ["RELEASE_COMMIT"]
+          prerelease = os.environ["RELEASE_PRERELEASE"] == "true"
+          manifest_name = "release-manifest.json"
+
+          targets = {
+              "x86_64-unknown-linux-gnu": "tar.gz",
+              "x86_64-pc-windows-msvc": "zip",
+              "x86_64-apple-darwin": "tar.gz",
+              "aarch64-apple-darwin": "tar.gz",
+          }
+          expected = {
+              f"treepack-{tag}-{target}.{extension}"
+              for target, extension in targets.items()
+          }
+
+          def gh(*args):
+              return subprocess.check_output(["gh", *args], text=True)
+
+          def api(endpoint):
+              return json.loads(gh("api", endpoint))
+
+          def list_releases():
+              pages = json.loads(gh(
+                  "api", "--paginate", "--slurp",
+                  f"repos/{repo}/releases?per_page=100",
+              ))
+              return [release for page in pages for release in page]
+
+          def find_release():
+              return next(
+                  (release for release in list_releases()
+                   if release["tag_name"] == tag),
+                  None,
+              )
+
+          def should_be_latest():
+              if prerelease:
+                  return False
+
+              # Maintenance releases must not replace a newer stable version.
+              current = tuple(map(int, version.split("+", 1)[0].split(".")))
+              stable_tag = re.compile(
+                  r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+                  r"(?:\+[0-9A-Za-z.-]+)?"
+              )
+              for other in list_releases():
+                  if other["draft"] or other["prerelease"]:
+                      continue
+                  match = stable_tag.fullmatch(other["tag_name"])
+                  if match and tuple(map(int, match.groups())) >= current:
+                      return False
+              return True
+
+          def assets(release):
+              pages = json.loads(gh(
+                  "api", "--paginate", "--slurp",
+                  f"repos/{repo}/releases/{release['id']}/assets?per_page=100",
+              ))
+              return {
+                  asset["name"]: asset
+                  for page in pages for asset in page
+                  if asset["state"] == "uploaded" and asset["size"] > 0
+              }
+
+          def download(asset, directory):
+              path = directory / asset["name"]
+              with path.open("wb") as output:
+                  subprocess.run([
+                      "gh", "api",
+                      f"repos/{repo}/releases/assets/{asset['id']}",
+                      "-H", "Accept: application/octet-stream",
+                  ], stdout=output, check=True)
+              return path
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          # Detect accidental tag movement, including annotated tags.
+          ref = api(f"repos/{repo}/git/ref/tags/{quote(tag, safe='')}")
+          obj = ref["object"]
+
+          for _ in range(10):
+              if obj["type"] != "tag":
+                  break
+              obj = api(f"repos/{repo}/git/tags/{obj['sha']}")["object"]
+
+          if obj["type"] != "commit" or obj["sha"] != commit:
+              sys.exit("Remote tag no longer points to the validated commit")
+
+          release = find_release()
+
+          if release is None:
+              if mode != "prepare":
+                  sys.exit("Prepared release not found")
+
+              gh(
+                  "release", "create", tag, "--draft",
+                  "--verify-tag", "--generate-notes",
+                  f"--prerelease={str(prerelease).lower()}",
+              )
+
+              release = find_release()
+              if release is None:
+                  sys.exit("Created draft could not be found")
+
+          remote = assets(release)
+
+          with tempfile.TemporaryDirectory() as temporary:
+              directory = Path(temporary)
+
+              if manifest_name not in remote:
+                  if mode != "prepare" or not release["draft"]:
+                      sys.exit("Release has no complete provenance manifest")
+
+                  files = {path.name: path for path in Path("dist").iterdir()}
+
+                  if set(files) != expected or any(
+                      not path.is_file() or path.stat().st_size == 0
+                      for path in files.values()
+                  ):
+                      sys.exit("Expected exactly four non-empty archives")
+
+                  manifest = {
+                      "schema": 1,
+                      "crate": "treepack",
+                      "version": version,
+                      "commit": commit,
+                      "prerelease": prerelease,
+                      "archives": {
+                          name: sha256(files[name]) for name in sorted(expected)
+                      },
+                  }
+
+                  checksums = "".join(
+                      f"{digest}  {name}\n"
+                      for name, digest in manifest["archives"].items()
+                  )
+
+                  checksum_path = directory / "SHA256SUMS"
+                  checksum_path.write_text(checksums, encoding="utf-8")
+
+                  manifest_path = directory / manifest_name
+                  manifest_path.write_text(
+                      json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                      encoding="utf-8",
+                  )
+
+                  # An unfinished draft can be rebuilt until its manifest
+                  # is uploaded. The manifest is the final readiness marker.
+                  for name in sorted(expected):
+                      gh("release", "upload", tag, str(files[name]), "--clobber")
+
+                  gh("release", "upload", tag, str(checksum_path), "--clobber")
+                  gh("release", "upload", tag, str(manifest_path), "--clobber")
+
+                  remote = assets(release)
+
+              required = expected | {"SHA256SUMS", manifest_name}
+              if not required.issubset(remote):
+                  sys.exit("Release is missing required assets")
+
+              manifest_path = download(remote[manifest_name], directory)
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+              identity = {
+                  "schema": 1,
+                  "crate": "treepack",
+                  "version": version,
+                  "commit": commit,
+                  "prerelease": prerelease,
+              }
+
+              if any(manifest.get(key) != value for key, value in identity.items()):
+                  sys.exit("Release manifest does not match this release")
+
+              hashes = manifest.get("archives", {})
+
+              if set(hashes) != expected or any(
+                  not isinstance(digest, str)
+                  or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                  for digest in hashes.values()
+              ):
+                  sys.exit("Invalid archive checksums in release manifest")
+
+              checksum_path = download(remote["SHA256SUMS"], directory)
+              expected_checksums = "".join(
+                  f"{hashes[name]}  {name}\n" for name in sorted(expected)
+              )
+
+              if checksum_path.read_text(encoding="utf-8") != expected_checksums:
+                  sys.exit("SHA256SUMS does not match the release manifest")
+
+              for name in sorted(expected):
+                  path = download(remote[name], directory)
+                  if sha256(path) != hashes[name]:
+                      sys.exit(f"Archive checksum mismatch: {name}")
+
+          if not release["draft"]:
+              if release["prerelease"] != prerelease:
+                  sys.exit("Published release has an incorrect prerelease flag")
+
+              print(f"Release {tag} is already published and verified")
+
+          elif mode == "prepare":
+              gh(
+                  "release", "edit", tag,
+                  f"--prerelease={str(prerelease).lower()}",
+              )
+              print(f"Draft {tag} is ready; publication waits for crates.io")
+
+          elif mode == "publish":
+              gh(
+                  "release", "edit", tag, "--draft=false",
+                  f"--prerelease={str(prerelease).lower()}",
+                  f"--latest={str(should_be_latest()).lower()}",
+              )
+              print(f"Published and verified release {tag}")
+
+          else:
+              sys.exit(f"Unknown release mode: {mode}")
 
   publish-crate:
     name: Publish to crates.io
-    needs: release
+    needs: [validate, prepare-release]
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
       id-token: write
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
 
-      - name: Setup Rust
-        run: |
-          rustup update stable
-          rustup default stable
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - *setup-rust
+
+      - name: Prepare expected crate package
+        run: cargo +stable package --locked --package treepack
+
+      - name: Check published crate version
+        id: registry
+        env:
+          REQUIRE_PUBLISHED: "false"
+        shell: python
+        run: &verify-crate-script |
+          import hashlib
+          import io
+          import json
+          import os
+          import sys
+          import tarfile
+          from pathlib import Path, PurePosixPath
+          from urllib.error import HTTPError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+          version = os.environ["RELEASE_VERSION"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          require_published = os.environ["REQUIRE_PUBLISHED"] == "true"
+          headers = {
+              "Accept": "application/json",
+              "User-Agent": f"treepack-release (https://github.com/{repo})",
+          }
+          package_url = (
+              "https://crates.io/api/v1/crates/treepack/"
+              + quote(version, safe="")
+          )
+
+          def package_files(content):
+              # Compare packaged files, not gzip timestamps or tar entry order.
+              files = {}
+              prefix = f"treepack-{version}"
+              with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+                  for member in archive:
+                      if member.isdir():
+                          continue
+                      path = PurePosixPath(member.name)
+                      if (
+                          not member.isfile()
+                          or path.is_absolute()
+                          or ".." in path.parts
+                          or len(path.parts) < 2
+                          or path.parts[0] != prefix
+                      ):
+                          sys.exit(f"Unexpected crate archive entry: {member.name}")
+                      name = str(PurePosixPath(*path.parts[1:]))
+                      if name in files:
+                          sys.exit(f"Duplicate crate archive entry: {name}")
+                      with archive.extractfile(member) as file:
+                          files[name] = (
+                              member.mode & 0o111,
+                              hashlib.sha256(file.read()).hexdigest(),
+                          )
+              if not files:
+                  sys.exit("Crate archive is empty")
+              return files
+
+          try:
+              with urlopen(Request(package_url, headers=headers), timeout=30) as response:
+                  data = json.load(response)
+          except HTTPError as error:
+              if error.code != 404 or require_published:
+                  raise
+              should_publish = True
+              print(f"treepack {version} is not published yet")
+          else:
+              if data["version"]["num"] != version:
+                  sys.exit("Unexpected crate version returned by crates.io")
+
+              if data["version"]["yanked"]:
+                  sys.exit("This crate version has been yanked")
+
+              local_path = Path("target/package") / f"treepack-{version}.crate"
+              expected = package_files(local_path.read_bytes())
+              download_headers = dict(headers, Accept="application/octet-stream")
+              with urlopen(
+                  Request(f"{package_url}/download", headers=download_headers),
+                  timeout=30,
+              ) as response:
+                  published = package_files(response.read())
+
+              differing = sorted(
+                  name for name in expected.keys() | published.keys()
+                  if expected.get(name) != published.get(name)
+              )
+              if differing:
+                  sys.exit(
+                      "Published crate differs from the validated checkout: "
+                      + ", ".join(differing)
+                  )
+
+              should_publish = False
+              print(f"Verified published contents of treepack {version}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(
+                  f"should_publish={str(should_publish).lower()}\n"
+              )
 
       - name: Authenticate with crates.io
+        if: steps.registry.outputs.should_publish == 'true'
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish crate
+        if: steps.registry.outputs.should_publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        shell: python
+        run: |
+          import json
+          import os
+          import subprocess
+          import sys
+          from urllib.parse import quote
+
+          repo = os.environ["GH_REPO"]
+          tag = os.environ["GITHUB_REF_NAME"]
+
+          def api(endpoint):
+              return json.loads(subprocess.check_output(
+                  ["gh", "api", endpoint], text=True
+              ))
+
+          obj = api(f"repos/{repo}/git/ref/tags/{quote(tag, safe='')}")["object"]
+          for _ in range(10):
+              if obj["type"] != "tag":
+                  break
+              obj = api(f"repos/{repo}/git/tags/{obj['sha']}")["object"]
+          if (
+              obj["type"] != "commit"
+              or obj["sha"] != os.environ["RELEASE_COMMIT"]
+          ):
+              sys.exit("Remote tag moved before cargo publish; refusing publication")
+
+          subprocess.run([
+              "cargo", "+stable", "publish", "--locked", "--package", "treepack",
+          ], check=True)
+
+      - name: Verify published crate contents
+        if: steps.registry.outputs.should_publish == 'true'
+        env:
+          REQUIRE_PUBLISHED: "true"
+        shell: python
+        run: *verify-crate-script
+
+  publish-release:
+    name: Publish GitHub release
+    needs: [validate, publish-crate]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    concurrency:
+      group: publish-release-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
+
+    env:
+      RELEASE_MODE: publish
+
+    steps:
+      - name: Verify assets and publish prepared draft
+        env: *release-env
+        shell: python
+        run: *release-script
